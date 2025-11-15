@@ -1,0 +1,155 @@
+name: Build Kernel + nailgun Module & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release Tag (e.g., v4.14.114-nailgun)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout dummy
+        uses: actions/checkout@v4
+
+      # ========== 克隆内核和工具链 ==========
+      - name: Clone Raspberry Pi Linux kernel (rpi-4.14.y)
+        run: |
+          git clone --depth=1 -b rpi-4.14.y https://github.com/raspberrypi/linux.git
+
+      - name: Clone Raspberry Pi tools
+        run: |
+          git clone --depth=1 https://github.com/raspberrypi/tools.git
+
+      # ========== 创建 modulespath 在当前目录 ==========
+      - name: Create modulespath directory
+        run: mkdir -p modulespath
+
+      # ========== 安装你指定的依赖 + 32 位库（关键修复） ==========
+      - name: Install dependencies (as requested) + 32-bit libs
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt update
+          sudo apt install -y \
+            vim \
+            g++ \
+            make \
+            libncurses-dev \
+            flex \
+            bison \
+            libc6:i386 \
+            libstdc++6:i386 \
+            zlib1g:i386
+
+      # ========== 设置环境变量 ==========
+      - name: Set environment
+        run: |
+          echo "CROSS_COMPILE=../tools/arm-bcm2708/gcc-linaro-arm-linux-gnueabihf-raspbian-x64/bin/arm-linux-gnueabihf-" >> $GITHUB_ENV
+          echo "ARCH=arm" >> $GITHUB_ENV
+          echo "HOSTCFLAGS=-fcommon" >> $GITHUB_ENV  # ✅ 关键：解决 yylloc 问题
+
+      # ========== 配置并编译内核（使用你指定的命令 + HOSTCFLAGS） ==========
+      - name: Configure kernel (bcm2709_defconfig)
+        working-directory: ./linux
+        run: |
+          make -j8 ARCH=arm CROSS_COMPILE=${{ env.CROSS_COMPILE }} bcm2709_defconfig
+
+      - name: Build zImage, dtbs, modules (your format + HOSTCFLAGS)
+        working-directory: ./linux
+        run: |
+          make -j8 \
+            HOSTCFLAGS="${{ env.HOSTCFLAGS }}" \
+            ARCH=arm \
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+            zImage dtbs modules
+
+      - name: Install kernel modules to modulespath
+        working-directory: ./linux
+        run: |
+          make -j8 \
+            HOSTCFLAGS="${{ env.HOSTCFLAGS }}" \
+            ARCH=arm \
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+            modules_install INSTALL_MOD_PATH=../modulespath
+
+      # ========== 确保 build 和 source 符号链接存在 ==========
+      - name: Ensure 'build' and 'source' symlinks
+        run: |
+          MODULE_VERSION=$(ls modulespath/lib/modules)
+          ln -sf $(pwd)/linux modulespath/lib/modules/$MODULE_VERSION/build
+          ln -sf $(pwd)/linux modulespath/lib/modules/$MODULE_VERSION/source
+
+      # ========== 克隆并准备 nailgun 模块 ==========
+      - name: Clone nailgun repository
+        run: |
+          git clone https://github.com/ningzhenyu/nailgun.git
+
+      - name: Prepare nailgun module source
+        run: |
+          mkdir -p nailgun-module
+          FOUND=$(find nailgun -type f -name nailgun.c | head -n1)
+          if [ -z "$FOUND" ]; then
+            echo "❌ Error: nailgun.c not found!"
+            exit 1
+          fi
+          cp "$FOUND" nailgun-module/nailgun.c
+
+          printf '%s\n' \
+            "obj-m += nailgun.o" \
+            "" \
+            "KERNELDIR ?= \$(shell pwd)/../modulespath/lib/modules/\$(shell ls ../modulespath/lib/modules | head -n1)/build" \
+            "" \
+            "all:" \
+            "	\$(MAKE) ARCH=arm -C \$(KERNELDIR) M=\$(PWD) CROSS_COMPILE=\$(CROSS_COMPILE) modules" \
+            "" \
+            "clean:" \
+            "	\$(MAKE) -C \$(KERNELDIR) M=\$(PWD) clean" \
+            > nailgun-module/Makefile
+
+      - name: Build nailgun kernel module
+        working-directory: ./nailgun-module
+        run: |
+          export CROSS_COMPILE=${{ env.CROSS_COMPILE }}
+          export HOSTCFLAGS=${{ env.HOSTCFLAGS }}  # 传递给模块编译（可选但安全）
+          make all
+
+      - name: Copy nailgun.ko into modules tree and export standalone
+        run: |
+          MODULE_VERSION=$(ls modulespath/lib/modules)
+          mkdir -p modulespath/lib/modules/$MODULE_VERSION/extra
+          cp nailgun-module/nailgun.ko modulespath/lib/modules/$MODULE_VERSION/extra/
+          cp nailgun-module/nailgun.ko ./  # 导出独立文件
+
+      # ========== 打包产物 ==========
+      - name: Prepare release assets
+        run: |
+          cp linux/arch/arm/boot/zImage ./kernel7.img
+          cp linux/arch/arm/boot/dts/*.dtb ./
+          tar -cJf rpi-kernel-modules.tar.xz -C modulespath .
+
+      - name: Create VERSION.txt
+        run: |
+          echo "Kernel version: $(cat linux/include/config/kernel.release)" > VERSION.txt
+          echo "Built with nailgun module" >> VERSION.txt
+          echo "Tag: ${{ github.event.inputs.tag }}" >> VERSION.txt
+
+      # ========== 发布到 Release ==========
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: Raspberry Pi Kernel + nailgun Module ${{ github.event.inputs.tag }}
+          files: |
+            kernel7.img
+            *.dtb
+            rpi-kernel-modules.tar.xz
+            nailgun.ko
+            VERSION.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
