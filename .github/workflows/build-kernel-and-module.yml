@@ -1,0 +1,192 @@
+name: Build Kernel + nailgun Module & Release (with custom head.S)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release Tag (e.g., v4.14.114-nailgun)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout your repository (contains custom head.S and other files)
+        uses: actions/checkout@v4
+
+      # ========== 克隆内核和工具链 ==========
+      - name: Clone Raspberry Pi Linux kernel (rpi-4.14.y)
+        run: |
+          git clone --depth=1 -b rpi-4.14.y https://github.com/raspberrypi/linux.git
+
+      - name: Clone Raspberry Pi tools
+        run: |
+          git clone --depth=1 https://github.com/raspberrypi/tools.git
+
+      # ========== 创建 modulespath 在当前目录 ==========
+      - name: Create modulespath directory
+        run: mkdir -p modulespath
+
+      # ========== 替换 head.S（核心步骤）==========
+      - name: Replace arch/arm/kernel/head.S with custom version
+        run: |
+          # 验证自定义 head.S 存在
+          if [ ! -f "head.S" ]; then
+            echo "❌ Error: head.S not found in repository root!"
+            exit 1
+          fi
+          # 验证目标路径存在
+          if [ ! -d "linux/arch/arm/kernel" ]; then
+            echo "❌ Error: Target directory linux/arch/arm/kernel does not exist!"
+            exit 1
+          fi
+          # 备份原文件
+          cp linux/arch/arm/kernel/head.S linux/arch/arm/kernel/head.S.orig
+          # 替换文件
+          cp head.S linux/arch/arm/kernel/head.S
+          echo "✅ Replaced linux/arch/arm/kernel/head.S with custom version"
+
+      # ========== 安装依赖 + 32 位库 ==========
+      - name: Install dependencies and 32-bit libs
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt update
+          sudo apt install -y \
+            vim \
+            g++ \
+            make \
+            libncurses-dev \
+            flex \
+            bison \
+            libc6:i386 \
+            libstdc++6:i386 \
+            zlib1g:i386
+
+      # ========== 设置环境变量 ==========
+      - name: Set environment
+        run: |
+          echo "CROSS_COMPILE=../tools/arm-bcm2708/gcc-linaro-arm-linux-gnueabihf-raspbian-x64/bin/arm-linux-gnueabihf-" >> $GITHUB_ENV
+          echo "ARCH=arm" >> $GITHUB_ENV
+          echo "HOSTCFLAGS=-fcommon" >> $GITHUB_ENV
+
+      # ========== 配置并编译内核 ==========
+      - name: Configure kernel (bcm2709_defconfig)
+        working-directory: ./linux
+        run: |
+          make ARCH=arm CROSS_COMPILE=${{ env.CROSS_COMPILE }} bcm2709_defconfig
+
+      - name: Build zImage, dtbs, modules
+        working-directory: ./linux
+        run: |
+          make -j8 \
+            HOSTCFLAGS="${{ env.HOSTCFLAGS }}" \
+            ARCH=arm \
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+            zImage dtbs modules
+
+      - name: Install kernel modules to modulespath
+        working-directory: ./linux
+        run: |
+          make -j8 \
+            HOSTCFLAGS="${{ env.HOSTCFLAGS }}" \
+            ARCH=arm \
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
+            modules_install INSTALL_MOD_PATH=../modulespath
+
+      # ========== 确保 build 和 source 符号链接存在 ==========
+      - name: Ensure 'build' and 'source' symlinks
+        run: |
+          MODULE_VERSION=$(ls modulespath/lib/modules)
+          ln -sf $(pwd)/linux modulespath/lib/modules/$MODULE_VERSION/build
+          ln -sf $(pwd)/linux modulespath/lib/modules/$MODULE_VERSION/source
+
+      # ========== 克隆并准备 nailgun 模块 ==========
+      - name: Clone nailgun repository
+        run: |
+          git clone https://github.com/ningzhenyu/nailgun.git
+
+      - name: Prepare nailgun module source
+        run: |
+          mkdir -p nailgun-module
+          FOUND=$(find nailgun -type f -name nailgun.c | head -n1)
+          if [ -z "$FOUND" ]; then
+            echo "❌ Error: nailgun.c not found!"
+            exit 1
+          fi
+          cp "$FOUND" nailgun-module/nailgun.c
+
+          # 复制 Module.symvers 确保符号匹配
+          cp linux/Module.symvers nailgun-module/
+
+          printf '%s\n' \
+            "obj-m += nailgun.o" \
+            "KBUILD_EXTRA_SYMBOLS := \$(PWD)/Module.symvers" \
+            "" \
+            "KERNELDIR ?= \$(shell pwd)/../modulespath/lib/modules/\$(shell ls ../modulespath/lib/modules | head -n1)/build" \
+            "" \
+            "all:" \
+            "	\$(MAKE) ARCH=arm -C \$(KERNELDIR) M=\$(PWD) CROSS_COMPILE=\$(CROSS_COMPILE) modules" \
+            "" \
+            "clean:" \
+            "	\$(MAKE) -C \$(KERNELDIR) M=\$(PWD) clean" \
+            > nailgun-module/Makefile
+
+      - name: Build nailgun kernel module
+        working-directory: ./nailgun-module
+        run: |
+          export CROSS_COMPILE=${{ env.CROSS_COMPILE }}
+          export HOSTCFLAGS=${{ env.HOSTCFLAGS }}
+          make all
+
+      - name: Copy nailgun.ko into modules tree and export standalone
+        run: |
+          MODULE_VERSION=$(ls modulespath/lib/modules)
+          mkdir -p modulespath/lib/modules/$MODULE_VERSION/extra
+          cp nailgun-module/nailgun.ko modulespath/lib/modules/$MODULE_VERSION/extra/
+          cp nailgun-module/nailgun.ko ./  # 导出独立文件
+
+      # ========== 打包产物 ==========
+      - name: Prepare release assets
+        run: |
+          cp linux/arch/arm/boot/zImage ./kernel7.img
+          cp linux/arch/arm/boot/dts/*.dtb ./
+          tar -cJf rpi-kernel-modules.tar.xz -C modulespath .
+
+      - name: Create VERSION.txt
+        run: |
+          echo "Kernel version: $(cat linux/include/config/kernel.release)" > VERSION.txt
+          echo "Built with custom head.S and nailgun module" >> VERSION.txt
+          echo "Tag: ${{ github.event.inputs.tag }}" >> VERSION.txt
+
+      # ========== 自动清理非法字符的 tag 名 ==========
+      - name: Sanitize tag name for GitHub release
+        id: sanitize_tag
+        run: |
+          INPUT_TAG="${{ github.event.inputs.tag }}"
+          CLEAN_TAG=$(echo "$INPUT_TAG" | sed 's/[^a-zA-Z0-9._-]/-/g' | tr '[:upper:]' '[:lower:]')
+          CLEAN_TAG=$(echo "$CLEAN_TAG" | sed 's/^[-.]*//' | sed 's/[-.]*$//')
+          if [ -z "$CLEAN_TAG" ]; then
+            CLEAN_TAG="release-$(date +%Y%m%d)"
+          fi
+          echo "Original tag: $INPUT_TAG"
+          echo "Sanitized tag: $CLEAN_TAG"
+          echo "tag_name=$CLEAN_TAG" >> $GITHUB_OUTPUT
+
+      # ========== 发布到 Release ==========
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sanitize_tag.outputs.tag_name }}
+          name: Raspberry Pi Kernel + nailgun Module ${{ github.event.inputs.tag }}
+          files: |
+            kernel7.img
+            *.dtb
+            rpi-kernel-modules.tar.xz
+            nailgun.ko
+            VERSION.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
