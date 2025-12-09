@@ -1,14 +1,14 @@
 name: Build CCA Lab Artifacts (Remote Source)
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
 
 permissions:
-  contents: write # 允许创建 Release
+  contents: write
 
 jobs:
   build-and-release:
-    runs-on: ubuntu-22.04 # 使用 GitHub 标准 x86_64 环境，速度快且稳定
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout Repository
@@ -18,26 +18,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake git bison flex bc libssl-dev device-tree-compiler python3 python3-pip wget
-          # 安装 Linux GNU 交叉编译器 (用于 Linux Kernel 和 kvmtool)
+          # 安装 Linux GNU 交叉编译器
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install Arm GNU Toolchain (Bare Metal)
         run: |
-          # 下载适用于 x86_64 主机的 GCC 13.2 aarch64-none-elf 编译器
           echo "Downloading Arm GNU Toolchain..."
           wget -q https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-aarch64-none-elf.tar.xz
           tar -xf arm-gnu-toolchain-13.2.rel1-x86_64-aarch64-none-elf.tar.xz
-          
-          # 设置环境变量路径
           echo "$(pwd)/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf/bin" >> $GITHUB_PATH
 
       - name: Download and Extract Source Code
         run: |
           BASE_URL="https://compass.sustech.edu.cn/cs315/2025Fall/tee-lab"
-          
-          echo "Downloading sources from $BASE_URL..."
-          
-          # 创建目录并解压，保持目录结构整洁
           mkdir tf-rmm linux-cca trusted-firmware-a kvmtool-cca
           
           wget -q -O tf-rmm.tar.xz "$BASE_URL/tf-rmm.tar.xz"
@@ -56,47 +49,29 @@ jobs:
         run: |
           export CROSS_COMPILE=aarch64-none-elf-
           cd tf-rmm
-          
           rm -rf build
-          # 使用修正后的 CMake 命令
           cmake -DRMM_CONFIG=fvp_defcfg -S . -B build -DLOG_LEVEL=40
           cmake --build build
-          
-          # 验证产物
-          ls -lh build/rmm.img
 
       - name: Build Linux Kernel
         run: |
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           cd linux-cca
-          
           make defconfig
-          # 使用所有核心编译
           make all -j$(nproc)
-          
-          # 验证产物
-          ls -lh arch/arm64/boot/Image
 
       - name: Build Trusted Firmware-A (TF-A)
         run: |
           export CROSS_COMPILE=aarch64-none-elf-
           cd trusted-firmware-a
           
-          # === 自动修复代码以适应 GCC 13 ===
-          echo "Applying fixes for GCC 13..."
-          # 将所有 -Werror 替换为 -Wno-error
+          # 修复 GCC 13 兼容性问题
           grep -rl "\-Werror" . | xargs sed -i 's/-Werror/-Wno-error/g'
-          # 移除链接器的致命警告设置
           grep -rl "\-\-fatal-warnings" . | xargs sed -i 's/--fatal-warnings//g'
           
-          # 清理
           make PLAT=fvp clean
           
-          # 编译命令：
-          # 1. 链接刚才编译好的 RMM
-          # 2. 修正 DTS 文件名为 fvp-base-gicv3-psci.dts
-          # 3. 使用 Release 模式 (DEBUG=0) 防止内存溢出
           make CROSS_COMPILE=aarch64-none-elf- \
           PLAT=fvp \
           CTX_INCLUDE_AARCH32_REGS=0 \
@@ -108,23 +83,28 @@ jobs:
           ARM_LINUX_KERNEL_AS_BL33=1 \
           PRELOADED_BL33_BASE=0x84000000 \
           all fip -j$(nproc)
-          
-          # 验证产物 (Release 模式在 build/fvp/release)
-          ls -lh build/fvp/release/bl1.bin
-          ls -lh build/fvp/release/fip.bin
 
-      - name: Build kvmtool
+      - name: Build kvmtool (Fix Deps)
         run: |
-          # 显式指定架构为 arm64，否则它会尝试编译 x86 代码
+          # 1. 下载并编译 libfdt (ARM64 静态库)
+          echo "Building libfdt for ARM64..."
+          git clone --depth 1 https://git.kernel.org/pub/scm/utils/dtc/dtc.git dtc-src
+          cd dtc-src
+          # 使用交叉编译器编译
+          make libfdt CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar
+          # 确保 libfdt.a 位于根目录，方便 kvmtool 查找
+          if [ -f libfdt/libfdt.a ]; then cp libfdt/libfdt.a .; fi
+          cd ..
+          
+          # 2. 编译 kvmtool
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           cd kvmtool-cca
           
           make clean
-          # 这里再次显式传递 ARCH=arm64 以确保万无一失
-          make lkvm-static ARCH=arm64 -j$(nproc)
+          # 关键：指定 LIBFDT_DIR 为刚才编译的目录，指定 ARCH 防止回退到 x86
+          make lkvm-static ARCH=arm64 LIBFDT_DIR=../dtc-src -j$(nproc)
           
-          # 验证产物
           ls -lh lkvm-static
 
       - name: Collect Artifacts
@@ -136,7 +116,7 @@ jobs:
           cp trusted-firmware-a/build/fvp/release/fip.bin artifacts/
           cp kvmtool-cca/lkvm-static artifacts/
           
-          echo "Build finished. Artifacts:"
+          echo "Artifacts collected:"
           ls -lh artifacts/
 
       - name: Create Release
@@ -144,8 +124,6 @@ jobs:
         with:
           tag_name: cca-lab-build-${{ github.run_number }}
           name: CCA Lab Binaries (Build ${{ github.run_number }})
-          draft: false
-          prerelease: false
           files: |
             artifacts/rmm.img
             artifacts/Image
