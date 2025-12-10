@@ -83,22 +83,25 @@ jobs:
           ARM_LINUX_KERNEL_AS_BL33=1 \
           PRELOADED_BL33_BASE=0x84000000 \
           all fip -j$(nproc)
-
+          
       - name: Build kvmtool (Fix Deps)
         run: |
           # 1. 下载并编译 libfdt (ARM64 静态库)
           echo "Building libfdt for ARM64..."
-          git clone --depth 1 https://git.kernel.org/pub/scm/utils/dtc/dtc.git dtc-src
+          
+          # [修正] 使用 GitHub 镜像源，解决 kernel.org 超时问题
+          git clone --depth 1 https://github.com/dgibson/dtc.git dtc-src
+          
           cd dtc-src
           
-          # 编译静态库 (不再编译 shared library 以免版本号问题)
+          # 编译静态库
           make libfdt CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar
           
-          # === 关键修正：手动创建一个标准的安装目录结构 ===
+          # === 手动创建一个标准的安装目录结构 ===
           mkdir -p ../libfdt-install/include
           mkdir -p ../libfdt-install/lib
           
-          # 复制头文件 (kvmtool 需要 libfdt.h)
+          # 复制头文件
           cp libfdt/libfdt.h ../libfdt-install/include/
           cp libfdt/fdt.h    ../libfdt-install/include/
           
@@ -113,10 +116,7 @@ jobs:
           
           make clean
           
-          # 关键参数修正：
-          # LIBFDT_DIR 指向安装根目录
-          # CFLAGS 手动指定头文件路径 (双重保险)
-          # LDFLAGS 手动指定库文件路径 (双重保险)
+          # 强制指定头文件和库路径
           make lkvm-static ARCH=arm64 \
             LIBFDT_DIR=../libfdt-install \
             CFLAGS="-I../libfdt-install/include" \
