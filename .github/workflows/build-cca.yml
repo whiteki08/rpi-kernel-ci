@@ -1,72 +1,61 @@
-name: Build CCA Lab (Cached & Optimized)
+name: Build CCA Lab Artifacts (Cached & Fixed)
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch:
 
 permissions:
-  contents: write # 允许发布 Release
+  contents: write
 
 jobs:
-  build-optimized:
+  build-final:
     runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 1. 安装基础工具 (每次都需要，但速度很快)
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake git bison flex bc libssl-dev device-tree-compiler python3 python3-pip wget
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      # 2. 尝试恢复缓存 (核心组件)
       - name: Restore Core Artifacts Cache
         id: cache-core
         uses: actions/cache@v3
         with:
-          # 我们要缓存的文件目录
           path: artifacts_core/
-          # 缓存的唯一指纹。如果你想强制重新编译内核，请修改这个版本号 (例如 v2)
           key: cca-lab-core-binaries-v1
 
-      # 3. 安装裸机编译器 (只有在缓存未命中时才需要，但为了保险起见，如果这里很快可以保留)
       - name: Install Arm GNU Toolchain
         if: steps.cache-core.outputs.cache-hit != 'true'
         run: |
-          echo "Cache Miss! Setting up toolchain for full build..."
           wget -q https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-aarch64-none-elf.tar.xz
           tar -xf arm-gnu-toolchain-13.2.rel1-x86_64-aarch64-none-elf.tar.xz
           echo "$(pwd)/arm-gnu-toolchain-13.2.Rel1-x86_64-aarch64-none-elf/bin" >> $GITHUB_PATH
 
-      # 4. 编译核心组件 (Kernel, RMM, TF-A)
-      # 仅在缓存没命中时运行 (if: cache-hit != 'true')
-      - name: Build Core Components (Skipped if Cached)
+      - name: Build Core Components
         if: steps.cache-core.outputs.cache-hit != 'true'
         run: |
-          echo "Starting Full Build..."
           BASE_URL="https://compass.sustech.edu.cn/cs315/2025Fall/tee-lab"
           mkdir tf-rmm linux-cca trusted-firmware-a
           
-          # === 下载源码 ===
+          # 下载
           wget -q -O tf-rmm.tar.xz "$BASE_URL/tf-rmm.tar.xz"
           tar -xf tf-rmm.tar.xz -C tf-rmm --strip-components=1
-          
           wget -q -O linux-cca.tar.xz "$BASE_URL/linux-cca.tar.xz"
           tar -xf linux-cca.tar.xz -C linux-cca --strip-components=1
-          
           wget -q -O trusted-firmware-a.tar.xz "$BASE_URL/trusted-firmware-a.tar.xz"
           tar -xf trusted-firmware-a.tar.xz -C trusted-firmware-a --strip-components=1
           
-          # === 编译 TF-RMM ===
+          # 编译 RMM
           export CROSS_COMPILE=aarch64-none-elf-
           cd tf-rmm
           cmake -DRMM_CONFIG=fvp_defcfg -S . -B build -DLOG_LEVEL=40
           cmake --build build
           cd ..
           
-          # === 编译 Linux Kernel ===
+          # 编译 Kernel
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           cd linux-cca
@@ -74,60 +63,45 @@ jobs:
           make all -j$(nproc)
           cd ..
 
-          # === 编译 TF-A ===
+          # 编译 TF-A
           export CROSS_COMPILE=aarch64-none-elf-
           cd trusted-firmware-a
-          
-          # 自动修复 GCC 13 问题
           grep -rl "\-Werror" . | xargs sed -i 's/-Werror/-Wno-error/g'
           grep -rl "\-\-fatal-warnings" . | xargs sed -i 's/--fatal-warnings//g'
-          
           make PLAT=fvp clean
-          
-          make CROSS_COMPILE=aarch64-none-elf- \
-          PLAT=fvp \
-          CTX_INCLUDE_AARCH32_REGS=0 \
-          ENABLE_RME=1 \
-          RMM=../tf-rmm/build/rmm.img \
-          FVP_HW_CONFIG_DTS=fdts/fvp-base-gicv3-psci.dts \
-          DEBUG=0 \
-          LOG_LEVEL=20 \
-          ARM_LINUX_KERNEL_AS_BL33=1 \
-          PRELOADED_BL33_BASE=0x84000000 \
-          all fip -j$(nproc)
+          make CROSS_COMPILE=aarch64-none-elf- PLAT=fvp CTX_INCLUDE_AARCH32_REGS=0 ENABLE_RME=1 RMM=../tf-rmm/build/rmm.img FVP_HW_CONFIG_DTS=fdts/fvp-base-gicv3-psci.dts DEBUG=0 LOG_LEVEL=20 ARM_LINUX_KERNEL_AS_BL33=1 PRELOADED_BL33_BASE=0x84000000 all fip -j$(nproc)
           cd ..
           
-          # === 保存到缓存目录 ===
+          # 缓存
           mkdir -p artifacts_core
           cp tf-rmm/build/rmm.img artifacts_core/
           cp linux-cca/arch/arm64/boot/Image artifacts_core/
           cp trusted-firmware-a/build/fvp/release/bl1.bin artifacts_core/
           cp trusted-firmware-a/build/fvp/release/fip.bin artifacts_core/
-          
-          echo "Core build complete. Artifacts saved."
 
-      # 5. 编译 kvmtool (每次都运行，方便调试)
-      - name: Build kvmtool (With Fixes)
+      - name: Build kvmtool (FIXED)
         run: |
-          echo "Building kvmtool..."
           BASE_URL="https://compass.sustech.edu.cn/cs315/2025Fall/tee-lab"
           mkdir kvmtool-cca
           wget -q -O kvmtool-cca.tar.xz "$BASE_URL/kvmtool-cca.tar.xz"
           tar -xf kvmtool-cca.tar.xz -C kvmtool-cca --strip-components=1
           
-          # 1. 下载并编译 libfdt (ARM64 静态库)
-          # 使用 GitHub 镜像避免连接超时
+          # 1. 准备 libfdt (ARM64 静态库)
           git clone --depth 1 https://github.com/dgibson/dtc.git dtc-src
           cd dtc-src
           make libfdt CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar
           
-          # === 扁平化目录结构修正 (针对 kvmtool Makefile 特性) ===
+          # === 扁平化安装 (符合 kvmtool Makefile 癖好) ===
           mkdir -p ../libfdt-flat
+          # 这里的路径是相对于 dtc-src 的
           cp libfdt/libfdt.h ../libfdt-flat/
           cp libfdt/fdt.h    ../libfdt-flat/
           cp libfdt/libfdt_env.h ../libfdt-flat/
           cp libfdt/libfdt.a ../libfdt-flat/
           
+          # 获取绝对路径，防止相对路径出问题
+          LIBFDT_ABS_PATH=$(readlink -f ../libfdt-flat)
+          echo "Libfdt installed at: $LIBFDT_ABS_PATH"
           cd ..
           
           # 2. 编译 kvmtool
@@ -135,18 +109,18 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           cd kvmtool-cca
           
-          make clean
+          # [修正] 移除 make clean，防止因缺少参数导致的解析错误
+          # 如果非要 clean，必须带上参数: make clean LIBFDT_DIR=$LIBFDT_ABS_PATH
           
-          # 显式指定所有路径
-          make lkvm-static ARCH=arm64 LIBFDT_DIR=../libfdt-flat -j$(nproc)
+          # 编译命令
+          make lkvm-static ARCH=arm64 LIBFDT_DIR=$LIBFDT_ABS_PATH -j$(nproc)
           
           ls -lh lkvm-static
 
-      # 6. 收集并发布
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: cca-lab-v${{ github.run_number }}
+          tag_name: cca-lab-final-${{ github.run_number }}
           name: CCA Lab Binaries (Build ${{ github.run_number }})
           files: |
             artifacts_core/rmm.img
