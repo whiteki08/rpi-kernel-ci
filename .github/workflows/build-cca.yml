@@ -90,10 +90,20 @@ jobs:
           echo "Building libfdt for ARM64..."
           git clone --depth 1 https://git.kernel.org/pub/scm/utils/dtc/dtc.git dtc-src
           cd dtc-src
-          # 使用交叉编译器编译
+          
+          # 编译静态库 (不再编译 shared library 以免版本号问题)
           make libfdt CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar
-          # 确保 libfdt.a 位于根目录，方便 kvmtool 查找
-          if [ -f libfdt/libfdt.a ]; then cp libfdt/libfdt.a .; fi
+          
+          # === 关键修正：手动创建一个标准的安装目录结构 ===
+          mkdir -p ../libfdt-install/include
+          mkdir -p ../libfdt-install/lib
+          
+          # 复制头文件 (kvmtool 需要 libfdt.h)
+          cp libfdt/libfdt.h ../libfdt-install/include/
+          cp libfdt/fdt.h    ../libfdt-install/include/
+          
+          # 复制静态库
+          cp libfdt/libfdt.a ../libfdt-install/lib/
           cd ..
           
           # 2. 编译 kvmtool
@@ -102,11 +112,19 @@ jobs:
           cd kvmtool-cca
           
           make clean
-          # 关键：指定 LIBFDT_DIR 为刚才编译的目录，指定 ARCH 防止回退到 x86
-          make lkvm-static ARCH=arm64 LIBFDT_DIR=../dtc-src -j$(nproc)
+          
+          # 关键参数修正：
+          # LIBFDT_DIR 指向安装根目录
+          # CFLAGS 手动指定头文件路径 (双重保险)
+          # LDFLAGS 手动指定库文件路径 (双重保险)
+          make lkvm-static ARCH=arm64 \
+            LIBFDT_DIR=../libfdt-install \
+            CFLAGS="-I../libfdt-install/include" \
+            LDFLAGS="-L../libfdt-install/lib" \
+            -j$(nproc)
           
           ls -lh lkvm-static
-
+          
       - name: Collect Artifacts
         run: |
           mkdir artifacts
